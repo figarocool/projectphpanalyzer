@@ -1,0 +1,62 @@
+#!/usr/bin/env php
+<?php
+
+require_once __DIR__ . '/../vendor/autoload.php';
+
+use ProjectManager\Analyzer\PhpAnalyzer;
+
+$logFile = '/tmp/php-analyzer-debug.log';
+$resultFile = '/tmp/php-analyzer-result.json';
+
+file_put_contents($logFile, date('c') . " - START\n", FILE_APPEND);
+
+if ($argc < 2) {
+    file_put_contents($logFile, "ERROR: No project path\n", FILE_APPEND);
+    echo "ERROR: No project path";
+    exit(1);
+}
+
+$projectPath = realpath($argv[1]);
+file_put_contents($logFile, "Project path: " . var_export($argv[1], true) . " resolved: " . var_export($projectPath, true) . "\n", FILE_APPEND);
+
+if ($projectPath === false || !is_dir($projectPath)) {
+    file_put_contents($logFile, "ERROR: Invalid path\n", FILE_APPEND);
+    echo "ERROR: Invalid project path";
+    exit(1);
+}
+
+set_error_handler(function ($severity, $message, $file, $line) {
+    file_put_contents($logFile, "PHP WARNING: $message in $file:$line\n", FILE_APPEND);
+    throw new ErrorException($message, 0, $severity, $file, $line);
+});
+
+try {
+    $analyzer = new PhpAnalyzer($projectPath);
+    $result = $analyzer->analyze();
+    $fullJson = json_encode($result, JSON_UNESCAPED_SLASHES);
+    file_put_contents($resultFile, $fullJson);
+    file_put_contents($logFile, "SUCCESS: " . count($result['files']) . " files analyzed, " . strlen($fullJson) . " bytes\n", FILE_APPEND);
+
+    // Create light version for the UI
+    $light = $result;
+    $light['files'] = [];
+    $importantCount = 0;
+    foreach ($result['files'] as $f) {
+        $hasContent = !empty($f['classes']) || !empty($f['dependencies']) || !empty($f['dbReferences']);
+        if ($hasContent && $importantCount < 3000) {
+            $light['files'][] = $f;
+            $importantCount++;
+        }
+    }
+    $light['filesTruncated'] = count($result['files']) - $importantCount;
+    $lightJson = json_encode($light, JSON_UNESCAPED_SLASHES);
+    file_put_contents('/tmp/php-analyzer-light.json', $lightJson);
+    file_put_contents($logFile, "LIGHT: $importantCount important files, " . strlen($lightJson) . " bytes\n", FILE_APPEND);
+    echo "OK:" . count($result['files']);
+} catch (Throwable $e) {
+    $errorMsg = $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine();
+    $trace = $e->getTraceAsString();
+    file_put_contents($logFile, "EXCEPTION: $errorMsg\nTRACE:\n$trace\n", FILE_APPEND);
+    echo "ERROR:" . $errorMsg;
+    exit(1);
+}
