@@ -7,6 +7,7 @@ interface GraphViewProps {
   nodes: GraphNode[]
   edges: GraphEdge[]
   onNodeClick: (nodeId: string) => void
+  onNodeDoubleClick?: (nodeId: string) => void
   layout: AppState['layout']
   selectedNode: string | null
   categoryColors: Record<FileCategory, string>
@@ -14,11 +15,20 @@ interface GraphViewProps {
   showDbSubgraph?: boolean
   onShowDbTables?: () => void
   onHideDbTables?: () => void
+  onGraphReady?: (ready: boolean) => void
+  positions?: Record<string, { x: number; y: number }> | null
+  graphView?: 'modules' | 'files'
+  activeModule?: string | null
+  onBackToModules?: () => void
+  graphFocus?: string | null
+  onClearFocus?: () => void
 }
 
 const GraphView = forwardRef<any, GraphViewProps>(({
-  nodes, edges, onNodeClick, layout, selectedNode, categoryColors, searchQuery,
-  showDbSubgraph, onShowDbTables, onHideDbTables,
+  nodes, edges, onNodeClick, onNodeDoubleClick, layout, selectedNode, categoryColors, searchQuery,
+  showDbSubgraph, onShowDbTables, onHideDbTables, onGraphReady, positions,
+  graphView, activeModule, onBackToModules,
+  graphFocus, onClearFocus,
 }, ref) => {
   const containerRef = useRef<HTMLDivElement>(null)
   const cyRef = useRef<cytoscape.Core | null>(null)
@@ -102,6 +112,25 @@ const GraphView = forwardRef<any, GraphViewProps>(({
             'border-opacity': 1,
             'text-wrap': 'wrap',
             'text-max-width': '140px',
+          },
+        },
+        {
+          selector: 'node[type="module"]',
+          style: {
+            'background-color': '#2a2a4a',
+            label: 'data(label)',
+            'text-valign': 'center',
+            'text-halign': 'center',
+            color: '#e0e0e0',
+            'font-size': '11px',
+            'font-weight': 'bold',
+            width: 120,
+            height: 50,
+            shape: 'round-rectangle',
+            'border-width': 3,
+            'border-color': '#4a4a6a',
+            'text-wrap': 'ellipsis',
+            'text-max-width': '110px',
           },
         },
         {
@@ -272,6 +301,7 @@ const GraphView = forwardRef<any, GraphViewProps>(({
     cy.on('dblclick', 'node', (evt) => {
       const node = evt.target
       cy.fit(node, 80)
+      setTimeout(() => onNodeDoubleClick?.(node.id()), 100)
     })
 
     const handleResize = () => {
@@ -309,6 +339,7 @@ const GraphView = forwardRef<any, GraphViewProps>(({
       const cy = cyRef.current
       if (!cy) {
         console.log('GraphView: cy not ready')
+        onGraphReady?.(false)
         return
       }
 
@@ -383,21 +414,43 @@ const GraphView = forwardRef<any, GraphViewProps>(({
         }
       })
 
-      if (nodesToAdd.length > 0 || (nodes.length > 0 && existingNodes.length === 0)) {
-        setTimeout(() => {
-          try {
-            console.log(`runLayout: start layout=${layout}`)
-            runLayout(cy, layout)
-            console.log('runLayout: done')
-          } catch (err) {
-            console.error('runLayout error:', err)
+      if (positions) {
+        const toPos: Record<string, any> = {}
+        nodes.forEach(n => {
+          const p = positions[n.id]
+          if (p) toPos[n.id] = p
+        })
+        if (Object.keys(toPos).length > 0) {
+          cy.nodes().positions((n: any) => toPos[n.id()] || { x: 0, y: 0 })
+          cy.resize()
+          const positioned = cy.nodes().filter((n: any) => toPos[n.id()])
+          if (positioned.length > 0) {
+            requestAnimationFrame(() => { (cy as any).fit(positioned, 50) })
           }
-        }, 100)
+        }
+        onGraphReady?.(false)
+      } else {
+        const needsLayout = nodesToAdd.length > 0 || (nodes.length > 0 && existingNodes.length === 0)
+        if (needsLayout) {
+          setTimeout(() => {
+            try {
+              console.log(`runLayout: start layout=${layout}`)
+              runLayout(cy, layout)
+              console.log('runLayout: done')
+            } catch (err) {
+              console.error('runLayout error:', err)
+              onGraphReady?.(false)
+            }
+          }, 100)
+        } else {
+          onGraphReady?.(false)
+        }
       }
     } catch (err) {
       console.error('GraphView update error:', err)
+      onGraphReady?.(false)
     }
-  }, [nodes, edges, categoryColors, layout])
+  }, [nodes, edges, categoryColors, layout, positions])
 
   useEffect(() => {
     const cy = cyRef.current
@@ -424,25 +477,35 @@ const GraphView = forwardRef<any, GraphViewProps>(({
   }, [selectedNode])
 
   const runLayout = useCallback((cy: cytoscape.Core, layoutName: string) => {
-    const base = { animate: false, fit: true, padding: 50 }
+    const base = { animate: false, fit: false, padding: 50 }
     let layoutConfig: any
 
     switch (layoutName) {
       case 'breadthfirst':
-        layoutConfig = { ...base, name: 'breadthfirst', directed: true, spacingFactor: 1.5, avoidOverlap: true }
+        layoutConfig = { ...base, name: 'breadthfirst', directed: true, spacingFactor: 2, avoidOverlap: true }
         break
       case 'cose':
-        layoutConfig = { ...base, name: 'cose', idealEdgeLength: 350, nodeOverlap: 80, refresh: 1, componentSpacing: 500, nodeRepulsion: 150000, edgeElasticity: 200, gravity: 0.02, numIter: 800, randomize: true }
+        layoutConfig = { ...base, name: 'cose', idealEdgeLength: 400, nodeOverlap: 80, refresh: 10, componentSpacing: 500, nodeRepulsion: 200000, edgeElasticity: 200, gravity: 0.05, numIter: 300, randomize: false }
         break
       case 'concentric':
-        layoutConfig = { ...base, name: 'concentric', concentric: (node: any) => node.data('lines') || 0, levelWidth: () => 2 }
+        layoutConfig = { ...base, name: 'concentric', concentric: (node: any) => node.data('lines') || 0, levelWidth: () => 2, spacingFactor: 2 }
         break
       default:
-        layoutConfig = { ...base, name: 'cose', idealEdgeLength: 350, nodeOverlap: 80, refresh: 1, componentSpacing: 500, nodeRepulsion: 150000, edgeElasticity: 200, gravity: 0.02, numIter: 800, randomize: true }
+        layoutConfig = { ...base, name: 'cose', idealEdgeLength: 400, nodeOverlap: 80, refresh: 10, componentSpacing: 500, nodeRepulsion: 200000, edgeElasticity: 200, gravity: 0.05, numIter: 300, randomize: false }
     }
 
-    cy.layout(layoutConfig).run()
-  }, [])
+    const layout = cy.layout(layoutConfig)
+    const timeout = setTimeout(() => {
+      try { layout.stop() } catch (e) {}
+      onGraphReady?.(false)
+    }, 30000)
+    layout.one('layoutstop', () => {
+      clearTimeout(timeout)
+      onGraphReady?.(false)
+    })
+    layout.run()
+    onGraphReady?.(true)
+  }, [onGraphReady])
 
   const tableCount = nodes.filter(n => n.type === 'table').length
 
@@ -452,6 +515,30 @@ const GraphView = forwardRef<any, GraphViewProps>(({
       className="cytoscape-container"
       style={{ width: '100%', height: '100%', position: 'relative' }}
     >
+      {graphView === 'files' && !showDbSubgraph && !graphFocus && (
+        <div style={{
+          position: 'absolute', top: 8, left: 8, zIndex: 20,
+          background: 'rgba(26,26,46,0.95)', border: '1px solid #2a2a4a', borderRadius: 6,
+          padding: '6px 12px', display: 'flex', alignItems: 'center', gap: 8,
+        }}>
+          <button className="btn btn-small" onClick={onBackToModules}>
+            ← Moduli
+          </button>
+          <span style={{ color: '#90caf9', fontSize: 12 }}>{nodes.length} file · {edges.length} dipendenze</span>
+        </div>
+      )}
+      {graphView === 'files' && graphFocus && (
+        <div style={{
+          position: 'absolute', top: 8, left: 8, zIndex: 20,
+          background: 'rgba(26,46,36,0.95)', border: '1px solid #2a6a4a', borderRadius: 6,
+          padding: '6px 12px', display: 'flex', alignItems: 'center', gap: 8,
+        }}>
+          <button className="btn btn-small" onClick={onClearFocus}>
+            ← Mostra tutto
+          </button>
+          <span style={{ color: '#81c784', fontSize: 12 }}>{nodes.length} nodi · {edges.length} dipendenze</span>
+        </div>
+      )}
       {showDbSubgraph && (
         <div style={{
           position: 'absolute', top: 8, left: 8, zIndex: 20,

@@ -1,10 +1,13 @@
-import React, { useState, useCallback, useRef, useEffect } from 'react'
+import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react'
 import type { ProjectAnalysis, FileInfo, AppState, FileCategory, GraphNode, GraphEdge, HistoryEntry, DbInfo } from './types'
 import GraphView from './components/GraphView'
-import ErDiagramView from './components/ErDiagramView'
+import FlowDiagramView from './components/FlowDiagramView'
 import CleanupPanel from './components/CleanupPanel'
+import CleanupDbPanel from './components/CleanupDbPanel'
 import FileTree from './components/FileTree'
 import SidePanel from './components/SidePanel'
+import FileEditor from './components/FileEditor'
+import SqliteBrowser from './components/SqliteBrowser'
 
 const API = window.electronAPI
 
@@ -116,37 +119,99 @@ function buildDbSubgraphData(analysis: ProjectAnalysis): { nodes: GraphNode[]; e
   return { nodes, edges }
 }
 
-function buildGraphData(analysis: ProjectAnalysis, showDbTables: boolean): { nodes: GraphNode[], edges: GraphEdge[] } {
+function modulePath(relativePath: string): string {
+  const parts = relativePath.split('/')
+  if (parts.length <= 2) return parts[0]
+  return parts[0] + '/' + parts[1]
+}
+
+function buildModuleGraphData(analysis: ProjectAnalysis): { nodes: GraphNode[], edges: GraphEdge[] } {
   const nodes: GraphNode[] = []
   const edges: GraphEdge[] = []
-  const addedNodes = new Set<string>()
-  const fileMap = new Map<string, FileInfo>()
-  const dirCount = new Map<string, number>()
-  const TOP = 100
-  const SEEN = new Set<string>()
+  const modules = new Map<string, { count: number; classes: number; files: FileInfo[] }>()
+  const fileModule = new Map<string, string>()
 
-  for (const f of analysis.files) fileMap.set(f.relativePath, f)
+  for (const f of analysis.files) {
+    if (f.classes.length === 0 && f.dependencies.length === 0 && f.dbReferences.length === 0) continue
+    const mod = modulePath(f.relativePath)
+    fileModule.set(f.relativePath, mod)
+    if (!modules.has(mod)) modules.set(mod, { count: 0, classes: 0, files: [] })
+    const m = modules.get(mod)!
+    m.count++
+    m.classes += f.classes.length
+    m.files.push(f)
+  }
+
+  const moduleList = [...modules.entries()].sort((a, b) => b[1].count - a[1].count)
+  const modNames = new Set(moduleList.map(([k]) => k))
+
+  for (const [mod, info] of moduleList) {
+    const label = mod.includes('/') ? mod.split('/').pop()! : mod
+    const catCount: Record<string, number> = {}
+    for (const f of info.files) {
+      const c = categorizeFile(f.relativePath)
+      catCount[c] = (catCount[c] || 0) + 1
+    }
+    const mainCat = Object.entries(catCount).sort((a, b) => b[1] - a[1])[0]?.[0] || 'other'
+    nodes.push({
+      id: `mod:${mod}`,
+      label: `${label} (${info.count})`,
+      type: 'module',
+      category: mainCat as FileCategory,
+      size: info.count,
+      lines: info.classes,
+      classes: info.files.map(f => f.relativePath),
+      dbTables: [],
+      path: mod,
+      fullPath: '',
+    })
+  }
+
+  const depCache = new Set<string>()
+  for (const [mod, info] of moduleList) {
+    for (const f of info.files) {
+      for (const dep of f.dependencies) {
+        if (!dep.resolvedPath) continue
+        const targetMod = fileModule.get(dep.resolvedPath)
+        if (targetMod && targetMod !== mod && modNames.has(targetMod)) {
+          const key = [mod, targetMod].sort().join('|')
+          if (!depCache.has(key)) {
+            depCache.add(key)
+            edges.push({
+              id: `moddep-${mod}-${targetMod}`,
+              source: `mod:${mod}`, target: `mod:${targetMod}`,
+              label: '', type: 'use',
+            })
+          }
+        }
+      }
+    }
+  }
+
+  return { nodes, edges }
+}
+
+function buildFileGraphData(analysis: ProjectAnalysis, moduleFilter: string | null, showDbTables: boolean): { nodes: GraphNode[], edges: GraphEdge[] } {
+  const nodes: GraphNode[] = []
+  const edges: GraphEdge[] = []
+  const fileMap = new Map<string, FileInfo>()
+
+  const files = moduleFilter
+    ? analysis.files.filter(f => modulePath(f.relativePath) === moduleFilter)
+    : analysis.files
+
+  for (const f of files) fileMap.set(f.relativePath, f)
 
   const scored: { file: FileInfo; score: number }[] = []
-  for (const f of analysis.files) {
+  for (const f of files) {
     const s = f.classes.length * 10 + f.dependencies.length * 3 + f.dbReferences.length * 5
     if (s > 0) scored.push({ file: f, score: s })
   }
   scored.sort((a, b) => b.score - a.score)
-  const topSet = new Set<string>()
-  for (let i = 0; i < Math.min(TOP, scored.length); i++) {
-    topSet.add(scored[i].file.relativePath)
-  }
 
-  for (const f of analysis.files) {
-    if (topSet.has(f.relativePath)) continue
-    const p = f.relativePath.split('/')
-    const dir = p.length > 1 ? p.slice(0, -1).join('/') : '_root'
-    dirCount.set(dir, (dirCount.get(dir) || 0) + 1)
-  }
+  const allSet = new Set(scored.map(s => s.file.relativePath))
 
   for (const s of scored) {
-    if (!topSet.has(s.file.relativePath)) continue
     const f = s.file
     nodes.push({
       id: f.relativePath,
@@ -160,38 +225,21 @@ function buildGraphData(analysis: ProjectAnalysis, showDbTables: boolean): { nod
       path: f.relativePath,
       fullPath: f.path,
     })
-    addedNodes.add(f.relativePath)
   }
 
   for (const s of scored) {
-    if (!topSet.has(s.file.relativePath)) continue
     for (const dep of s.file.dependencies) {
-      if (dep.resolvedPath) {
-        if (topSet.has(dep.resolvedPath)) {
-          edges.push({
-            id: `dep-${s.file.relativePath}-${dep.resolvedPath}-${dep.type}`,
-            source: s.file.relativePath, target: dep.resolvedPath,
-            label: dep.type, type: dep.type,
-          })
-        } else if (!SEEN.has(dep.resolvedPath)) {
-          SEEN.add(dep.resolvedPath)
-        }
+      if (dep.resolvedPath && allSet.has(dep.resolvedPath)) {
+        edges.push({
+          id: `dep-${s.file.relativePath}-${dep.resolvedPath}-${dep.type}`,
+          source: s.file.relativePath, target: dep.resolvedPath,
+          label: dep.type, type: dep.type,
+        })
       }
     }
   }
 
-  for (const [dir, count] of dirCount) {
-    if (count > 0) {
-      const label = dir === '_root' ? '/' : dir.split('/').pop() || dir
-      nodes.push({
-        id: `dir:${dir}`, label: `${label} (${count})`, type: 'dir',
-        category: 'other', size: count, lines: 0,
-        classes: [], dbTables: [], path: dir, fullPath: '',
-      })
-    }
-  }
-
-  if (showDbTables) {
+  if (showDbTables && scored.length > 0) {
     const dbNodeId = '_database'
     nodes.push({
       id: dbNodeId, label: 'Database', type: 'database',
@@ -200,7 +248,6 @@ function buildGraphData(analysis: ProjectAnalysis, showDbTables: boolean): { nod
     })
     const fileTables = new Map<string, string[]>()
     for (const s of scored) {
-      if (!topSet.has(s.file.relativePath)) continue
       for (const ref of s.file.dbReferences) {
         if (!fileTables.has(s.file.relativePath)) fileTables.set(s.file.relativePath, [])
         const arr = fileTables.get(s.file.relativePath)!
@@ -214,15 +261,6 @@ function buildGraphData(analysis: ProjectAnalysis, showDbTables: boolean): { nod
         label: tables.join(', '), type: 'db',
       })
     }
-  }
-
-  const hidden = Math.max(0, scored.length - TOP)
-  if (hidden > 0) {
-    nodes.push({
-      id: '_more', label: `+${hidden} file`, type: 'dir',
-      category: 'other', size: 0, lines: 0,
-      classes: [], dbTables: [], path: '', fullPath: '',
-    })
   }
 
   return { nodes, edges }
@@ -243,19 +281,57 @@ export default function App() {
   })
 
   const [graphData, setGraphData] = useState<{ nodes: GraphNode[]; edges: GraphEdge[] }>({ nodes: [], edges: [] })
+  const [graphLoading, setGraphLoading] = useState(false)
+  const [progress, setProgress] = useState(0)
+  const [layoutPositions, setLayoutPositions] = useState<Record<string, { x: number; y: number }> | null>(null)
+  const [graphView, setGraphView] = useState<'modules' | 'files'>('modules')
+  const [activeModule, setActiveModule] = useState<string | null>(null)
+  const [graphFocus, setGraphFocus] = useState<string | null>(null)
+  const graphLoadingRef = useRef(false)
   const [version, setVersion] = useState('')
   const [history, setHistory] = useState<HistoryEntry[]>([])
-  const [activeTab, setActiveTab] = useState<'graph' | 'er' | 'cleanup'>('graph')
+  const [activeTab, setActiveTab] = useState<'graph' | 'er' | 'cleanup' | 'cleanup-db'>('graph')
   const [fileTreeSort, setFileTreeSort] = useState<'name' | 'size'>('name')
   const [graphSearch, setGraphSearch] = useState('')
   const [dbInfo, setDbInfo] = useState<DbInfo | null>(null)
   const [showDbSubgraph, setShowDbSubgraph] = useState(false)
   const [dbSubgraphData, setDbSubgraphData] = useState<{ nodes: GraphNode[]; edges: GraphEdge[] }>({ nodes: [], edges: [] })
   const graphRef = useRef<any>(null)
+  const [editorFile, setEditorFile] = useState<{ path: string; fullPath: string } | null>(null)
+  const [sqliteBrowserPath, setSqliteBrowserPath] = useState<string | null>(null)
+
+  const displayGraphData = useMemo(() => {
+    if (graphFocus && graphView === 'files') {
+      const focus = graphFocus
+      const neighborIds = new Set([focus])
+      for (const e of graphData.edges) {
+        if (e.source === focus || e.target === focus) {
+          neighborIds.add(e.source)
+          neighborIds.add(e.target)
+        }
+      }
+      return {
+        nodes: graphData.nodes.filter(n => neighborIds.has(n.id)),
+        edges: graphData.edges.filter(e => neighborIds.has(e.source) && neighborIds.has(e.target)),
+      }
+    }
+    return graphData
+  }, [graphData, graphFocus, graphView])
+
+  const displayPositions = useMemo(() => {
+    if (!layoutPositions) return null
+    if (!graphFocus || graphView !== 'files') return layoutPositions
+    const filtered: Record<string, { x: number; y: number }> = {}
+    for (const n of displayGraphData.nodes) {
+      if (layoutPositions[n.id]) filtered[n.id] = layoutPositions[n.id]
+    }
+    return Object.keys(filtered).length > 0 ? filtered : null
+  }, [layoutPositions, graphFocus, graphView, displayGraphData])
 
   useEffect(() => {
     API.getVersion().then(setVersion).catch(() => setVersion('1.0.0'))
     API.historyList().then(setHistory).catch(() => {})
+    API.onProgress((pct) => setProgress(pct))
   }, [])
 
   const [manualPath, setManualPath] = useState('')
@@ -264,6 +340,9 @@ export default function App() {
     try {
       setState(prev => ({ ...prev, projectPath, loading: true, error: null, selectedFile: null, analysis: null }))
       setGraphData({ nodes: [], edges: [] })
+      setGraphLoading(false)
+      setLayoutPositions(null)
+      setProgress(0)
       const analysis = await API.loadCached(projectPath)
       if (analysis) {
         setState(prev => ({ ...prev, analysis, loading: false }))
@@ -272,6 +351,7 @@ export default function App() {
       }
     } catch (err: any) {
       setState(prev => ({ ...prev, loading: false, error: err.message || 'Errore caricamento' }))
+      setGraphLoading(false)
     }
   }, [])
 
@@ -295,6 +375,9 @@ export default function App() {
     if (!projectPath) return
     setState(prev => ({ ...prev, projectPath, loading: true, error: null, selectedFile: null, analysis: null }))
     setGraphData({ nodes: [], edges: [] })
+    setGraphLoading(false)
+    setLayoutPositions(null)
+    setProgress(0)
     setDbInfo(null)
 
     try {
@@ -309,6 +392,7 @@ export default function App() {
     } catch (err: any) {
       console.log('runAnalysis: error', err.message)
       setState(prev => ({ ...prev, loading: false, error: err.message || 'Errore durante l\'analisi' }))
+      setGraphLoading(false)
     }
   }, [])
 
@@ -319,14 +403,65 @@ export default function App() {
   }, [manualPath, runAnalysis])
 
   useEffect(() => {
-    if (state.analysis) {
-      console.log(`buildGraphData start: ${state.analysis.files.length} files`)
-      const data = buildGraphData(state.analysis, state.showDbTables)
-      console.log(`buildGraphData done: ${data.nodes.length} nodes, ${data.edges.length} edges`)
+    graphLoadingRef.current = graphLoading
+  }, [graphLoading])
+
+  useEffect(() => {
+    const a = state.analysis
+    if (!a) return
+    setGraphLoading(true)
+    setLayoutPositions(null)
+    const showDb = state.showDbTables
+    requestAnimationFrame(() => {
+      let data: { nodes: GraphNode[]; edges: GraphEdge[] }
+      if (graphView === 'modules') {
+        data = buildModuleGraphData(a)
+      } else {
+        data = buildFileGraphData(a, activeModule, showDb)
+      }
+      console.log(`buildGraphData: ${data.nodes.length} nodes, ${data.edges.length} edges`)
       setGraphData(data)
-      console.log('setGraphData called')
-    }
-  }, [state.analysis, state.showDbTables])
+      if (data.nodes.length > 0) {
+        API.computeLayout({ nodes: data.nodes.map(n => ({ id: n.id })), edges: data.edges.map(e => ({ source: e.source, target: e.target })) })
+          .then(result => {
+            setLayoutPositions(result.positions)
+            setGraphLoading(false)
+          })
+          .catch(err => {
+            console.error('layout compute error:', err)
+            setGraphLoading(false)
+          })
+      } else {
+        setGraphLoading(false)
+      }
+    })
+  }, [state.analysis, state.showDbTables, graphView, activeModule])
+
+  const handleGraphReady = useCallback(() => {
+    setGraphLoading(false)
+  }, [])
+
+  const handleExpandModule = useCallback((moduleId: string) => {
+    const modPath = moduleId.replace(/^mod:/, '')
+    setActiveModule(modPath)
+    setGraphView('files')
+    setShowDbSubgraph(false)
+  }, [])
+
+  const handleBackToModules = useCallback(() => {
+    setActiveModule(null)
+    setGraphView('modules')
+    setShowDbSubgraph(false)
+    setGraphFocus(null)
+  }, [])
+
+  const handleFileFocus = useCallback((filePath: string) => {
+    setGraphFocus(filePath)
+  }, [])
+
+  const handleClearFocus = useCallback(() => {
+    setGraphFocus(null)
+  }, [])
 
   const handleShowDbTables = useCallback(() => {
     if (!state.analysis || state.analysis.summary.totalDbReferences === 0) return
@@ -365,6 +500,10 @@ export default function App() {
 
   const handleNodeClick = useCallback((nodeId: string) => {
     if (!state.analysis) return
+    if (nodeId.startsWith('mod:') && graphView === 'modules') {
+      handleExpandModule(nodeId)
+      return
+    }
     if (nodeId === '_database') {
       const tableMap = new Map<string, { files: { path: string; operations: string[] }[] }>()
       for (const f of state.analysis.files) {
@@ -386,17 +525,39 @@ export default function App() {
       setDbInfo(null)
       const file = state.analysis.files.find(f => f.relativePath === nodeId)
       setState(prev => ({ ...prev, selectedFile: file || null }))
+      if (graphView === 'files') {
+        if (file) {
+          setGraphFocus(nodeId)
+        } else {
+          setGraphFocus(null)
+        }
+      }
     }
-  }, [state.analysis])
+  }, [state.analysis, graphView, handleExpandModule])
 
   const handleFileSelect = useCallback((relativePath: string) => {
     if (!state.analysis) return
     const file = state.analysis.files.find(f => f.relativePath === relativePath)
     setState(prev => ({ ...prev, selectedFile: file || null }))
+    const mod = modulePath(relativePath)
+    if (graphView === 'modules') {
+      setActiveModule(mod)
+      setGraphView('files')
+      setShowDbSubgraph(false)
+    }
+    setGraphFocus(relativePath)
     if (graphRef.current && graphRef.current.zoomToNode) {
       graphRef.current.zoomToNode(relativePath)
     }
-  }, [state.analysis])
+  }, [state.analysis, graphView])
+
+  const handleFileDoubleClick = useCallback((relativePath: string, fullPath: string) => {
+    setEditorFile({ path: relativePath, fullPath })
+  }, [])
+
+  const handleOpenSqliteBrowser = useCallback((dbPath: string) => {
+    setSqliteBrowserPath(dbPath)
+  }, [])
 
   const updateLayout = useCallback((layout: AppState['layout']) => {
     setState(prev => ({ ...prev, layout }))
@@ -447,6 +608,8 @@ export default function App() {
               <button className="btn btn-small" onClick={() => {
                 setState(prev => ({ ...prev, projectPath: null, analysis: null, selectedFile: null, error: null }))
                 setGraphData({ nodes: [], edges: [] })
+                setGraphLoading(false)
+                setLayoutPositions(null)
                 setDbInfo(null)
                 setShowDbSubgraph(false)
                 setActiveTab('graph')
@@ -484,10 +647,28 @@ export default function App() {
       {state.loading && (
         <div className="loading-overlay">
           <div className="loading-spinner" />
-          <p>Analisi del progetto in corso...</p>
+          <p>Analisi del progetto in corso... {progress > 0 ? `${progress}%` : ''}</p>
+          {progress > 0 && (
+            <div className="progress-bar">
+              <div className="progress-fill" style={{ width: `${progress}%` }} />
+            </div>
+          )}
         </div>
       )}
 
+      {editorFile && (
+        <FileEditor
+          filePath={editorFile.path}
+          fullPath={editorFile.fullPath}
+          onClose={() => setEditorFile(null)}
+        />
+      )}
+      {sqliteBrowserPath && (
+        <SqliteBrowser
+          dbPath={sqliteBrowserPath}
+          onClose={() => setSqliteBrowserPath(null)}
+        />
+      )}
       {state.error && (
         <div className="error-bar">
           <span>❌ {state.error}</span>
@@ -635,6 +816,7 @@ export default function App() {
               files={filteredFiles}
               selectedFile={state.selectedFile?.relativePath || null}
               onFileSelect={handleFileSelect}
+              onFileDoubleClick={handleFileDoubleClick}
               sortBy={fileTreeSort}
             />
           </aside>
@@ -657,7 +839,13 @@ export default function App() {
                 className={`tab-btn ${activeTab === 'cleanup' ? 'active' : ''}`}
                 onClick={() => setActiveTab('cleanup')}
               >
-                🧹 Pulizia
+                Pulizia
+              </button>
+              <button
+                className={`tab-btn ${activeTab === 'cleanup-db' ? 'active' : ''}`}
+                onClick={() => setActiveTab('cleanup-db')}
+              >
+                Pulizia DB
               </button>
               <div className="graph-search">
                 <input
@@ -670,24 +858,51 @@ export default function App() {
               </div>
             </div>
             {activeTab === 'graph' ? (
-              <GraphView
-                ref={graphRef}
-                nodes={showDbSubgraph ? dbSubgraphData.nodes : graphData.nodes}
-                edges={showDbSubgraph ? dbSubgraphData.edges : graphData.edges}
-                onNodeClick={handleNodeClick}
-                layout={state.layout}
-                selectedNode={state.selectedFile?.relativePath || null}
-                categoryColors={CATEGORY_COLORS}
-                searchQuery={graphSearch}
-                showDbSubgraph={showDbSubgraph}
-                onShowDbTables={handleShowDbTables}
-                onHideDbTables={handleHideDbTables}
-              />
+              <div style={{ position: 'relative', flex: 1, minHeight: 0 }}>
+                {graphLoading && (
+                  <div className="loading-overlay" style={{ position: 'absolute' }}>
+                    <div className="loading-spinner" />
+                    <p>Generazione grafico in corso...</p>
+                  </div>
+                )}
+                <GraphView
+                  ref={graphRef}
+                  nodes={showDbSubgraph ? dbSubgraphData.nodes : displayGraphData.nodes}
+                  edges={showDbSubgraph ? dbSubgraphData.edges : displayGraphData.edges}
+                  onNodeClick={handleNodeClick}
+                  onNodeDoubleClick={(nodeId) => {
+                    if (nodeId === '_database') {
+                      const mainDb = state.projectPath ? state.projectPath + '/database/database.sqlite' : null
+                      if (mainDb) handleOpenSqliteBrowser(mainDb)
+                    }
+                  }}
+                  layout={state.layout}
+                  selectedNode={state.selectedFile?.relativePath || null}
+                  categoryColors={CATEGORY_COLORS}
+                  searchQuery={graphSearch}
+                  showDbSubgraph={showDbSubgraph}
+                  onShowDbTables={handleShowDbTables}
+                  onHideDbTables={handleHideDbTables}
+                  onGraphReady={handleGraphReady}
+                  positions={showDbSubgraph ? null : displayPositions}
+                  graphView={graphView}
+                  activeModule={activeModule}
+                  onBackToModules={handleBackToModules}
+                  graphFocus={graphFocus}
+                  onClearFocus={handleClearFocus}
+                />
+              </div>
             ) : activeTab === 'er' ? (
-              <ErDiagramView
+              <FlowDiagramView
                 analysis={state.analysis}
                 searchQuery={graphSearch}
+                onFileSelect={(path) => {
+                  const file = state.analysis!.files.find(f => f.relativePath === path)
+                  if (file) setState(prev => ({ ...prev, selectedFile: file || null }))
+                }}
               />
+            ) : activeTab === 'cleanup-db' ? (
+              <CleanupDbPanel projectPath={state.projectPath || ''} onOpenSqlite={handleOpenSqliteBrowser} />
             ) : (
               <CleanupPanel projectPath={state.projectPath || ''} onFilesDeleted={handleFilesDeleted} />
             )}

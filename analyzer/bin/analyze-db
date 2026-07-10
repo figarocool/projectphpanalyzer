@@ -1,0 +1,385 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Database audit script.
+ * Usage: php analyze-db <project-path>
+ *
+ * Parses project config to detect DB, connects, fetches schema,
+ * compares with code references from analysis result, outputs JSON.
+ */
+
+if ($argc < 2) {
+  echo json_encode(['error' => 'No project path provided']);
+  exit(1);
+}
+
+$projectPath = realpath($argv[1]);
+if (!$projectPath || !is_dir($projectPath)) {
+  echo json_encode(['error' => 'Invalid project path']);
+  exit(1);
+}
+
+$result = [
+  'dbType' => null,
+  'dbName' => null,
+  'configFound' => false,
+  'connectionOk' => false,
+  'connectionError' => null,
+  'tablesInDb' => [],
+  'tablesUsed' => [],
+  'tablesUnused' => [],
+  'columnsUnused' => [],
+  'orphanSqliteFiles' => [],
+];
+
+// ── 1. Detect DB config ────────────────────────────────────────
+
+$dotEnv = [];
+$envPath = $projectPath . '/.env';
+$envExamplePath = $projectPath . '/.env.example';
+
+foreach ([$envPath, $envExamplePath] as $p) {
+  if (file_exists($p)) {
+    foreach (file($p, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+      $line = trim($line);
+      if ($line === '' || $line[0] === '#') continue;
+      $parts = explode('=', $line, 2);
+      if (count($parts) === 2) $dotEnv[trim($parts[0])] = trim($parts[1], '"\' ');
+    }
+    if (!empty($dotEnv)) break;
+  }
+}
+
+$dbConfig = [
+  'connection' => $dotEnv['DB_CONNECTION']
+    ?? $dotEnv['DB_DRIVER']
+    ?? $dotEnv['DATABASE_DRIVER']
+    ?? 'mysql',
+  'host' => $dotEnv['DB_HOST'] ?? $dotEnv['DATABASE_HOST'] ?? '127.0.0.1',
+  'port' => $dotEnv['DB_PORT'] ?? $dotEnv['DATABASE_PORT'] ?? null,
+  'database' => $dotEnv['DB_DATABASE']
+    ?? $dotEnv['DATABASE_NAME']
+    ?? $dotEnv['DB_NAME']
+    ?? null,
+  'username' => $dotEnv['DB_USERNAME'] ?? $dotEnv['DATABASE_USER'] ?? $dotEnv['DB_USER'] ?? 'root',
+  'password' => $dotEnv['DB_PASSWORD'] ?? $dotEnv['DATABASE_PASSWORD'] ?? '',
+];
+
+// Parse DATABASE_URL (Symfony-style)
+if (!empty($dotEnv['DATABASE_URL'])) {
+  $parts = parse_url($dotEnv['DATABASE_URL']);
+  if ($parts) {
+    $dbConfig['connection'] = $parts['scheme'] ?? 'mysql';
+    $dbConfig['host'] = $parts['host'] ?? '127.0.0.1';
+    $dbConfig['port'] = $parts['port'] ?? null;
+    $dbConfig['database'] = ltrim($parts['path'] ?? '', '/');
+    $dbConfig['username'] = $parts['user'] ?? 'root';
+    $dbConfig['password'] = $parts['pass'] ?? '';
+  }
+}
+
+// Try config/database.php (Laravel-style)
+$configFile = $projectPath . '/config/database.php';
+if (!isset($dotEnv['DB_CONNECTION']) && file_exists($configFile)) {
+  $configContent = file_get_contents($configFile);
+  $result['configFound'] = true;
+  // Try to extract default connection
+  if (preg_match("/'default'\s*=>\s*'env'\s*\(\s*'DB_CONNECTION'\s*,\s*'([^']+)'/", $configContent, $m)) {
+    $dbConfig['connection'] = $m[1];
+  } elseif (preg_match("/'default'\s*=>\s*'([^']+)'/", $configContent, $m)) {
+    $dbConfig['connection'] = $m[1];
+  }
+}
+
+$result['dbType'] = $dbConfig['connection'];
+$result['dbName'] = $dbConfig['database'];
+
+// Detect SQLite from connection type
+$isSqlite = false;
+$sqlitePath = null;
+$connLower = strtolower($dbConfig['connection']);
+
+if ($connLower === 'sqlite' || $connLower === 'sqlite3') {
+  $isSqlite = true;
+  $sqlitePath = $dbConfig['database'];
+  // Resolve relative SQLite path
+  if ($sqlitePath && !str_starts_with($sqlitePath, '/')) {
+    $candidates = [
+      $projectPath . '/database/' . $sqlitePath,
+      $projectPath . '/' . $sqlitePath,
+      $projectPath . '/storage/' . $sqlitePath,
+    ];
+    foreach ($candidates as $c) {
+      if (file_exists($c)) { $sqlitePath = realpath($c); break; }
+    }
+  }
+}
+
+// Also detect SQLite by checking common files
+if (!$isSqlite) {
+  $commonPaths = [
+    $projectPath . '/database/database.sqlite',
+    $projectPath . '/data/database.sqlite',
+    $projectPath . '/app.db',
+    $projectPath . '/db.sqlite',
+  ];
+  foreach ($commonPaths as $p) {
+    if (file_exists($p)) {
+      $isSqlite = true;
+      $sqlitePath = realpath($p);
+      $result['dbType'] = 'sqlite';
+      $result['dbName'] = basename($sqlitePath);
+      break;
+    }
+  }
+}
+
+$result['configFound'] = true;
+
+// ── 2. Load analysis references from cached result ────────────
+
+$usedTables = [];
+$usedColumns = []; // table => [col1, col2, ...]
+$codeFilesUsingTables = []; // table => [file1, file2, ...]
+
+// Try cached analysis file
+$candidates = [
+  '/tmp/php-analyzer-result.json',
+  '/tmp/php-analyzer-light.json',
+];
+$analysisData = null;
+foreach ($candidates as $cf) {
+  if (file_exists($cf)) {
+    $analysisData = json_decode(file_get_contents($cf), true);
+    if ($analysisData) break;
+  }
+}
+
+if (!$analysisData) {
+  // Try userData cache directory
+  $hash = md5($projectPath);
+  $home = getenv('HOME') ?: '/home/' . getenv('USER');
+  $userDataDirs = [
+    $home . '/.config/php-project-analyzer/projects',
+    $home . '/.config/php-project-analyzer/projects',
+  ];
+  foreach ($userDataDirs as $ud) {
+    $cf = $ud . '/' . $hash . '.json';
+    if (file_exists($cf)) {
+      $analysisData = json_decode(file_get_contents($cf), true);
+      if ($analysisData) break;
+    }
+  }
+}
+
+if ($analysisData && isset($analysisData['files'])) {
+  foreach ($analysisData['files'] as $f) {
+    if (empty($f['dbReferences'])) continue;
+    foreach ($f['dbReferences'] as $ref) {
+      $table = $ref['table'] ?? '';
+      $tables = [$table];
+      // If PascalCase, also try snake_case (model → table mapping)
+      if ($table && ctype_upper($table[0])) {
+        $snake = strtolower(preg_replace('/(?<!^)[A-Z]/', '_$0', $table));
+        $tables[] = $snake;
+        if (substr($snake, -1) !== 's') $tables[] = $snake . 's';
+        else $tables[] = substr($snake, 0, -1);
+      }
+      $tables = array_unique(array_filter($tables));
+      foreach ($tables as $t) {
+        if (!in_array($t, $usedTables)) $usedTables[] = $t;
+        if (!isset($codeFilesUsingTables[$t])) $codeFilesUsingTables[$t] = [];
+        if (!in_array($f['relativePath'], $codeFilesUsingTables[$t])) {
+          $codeFilesUsingTables[$t][] = $f['relativePath'];
+        }
+      }
+
+      // Extract columns from context
+      $ctx = $ref['context'] ?? '';
+      if ($ctx) {
+        if (!isset($usedColumns[$table])) $usedColumns[$table] = [];
+        extractCols($ctx, $usedColumns[$table]);
+      }
+    }
+  }
+}
+
+$result['tablesUsed'] = $usedTables;
+
+// ── 3. Connect and fetch schema ──────────────────────────────
+
+$dbSchema = []; // table => [col1, col2, ...]
+
+if ($isSqlite && $sqlitePath && file_exists($sqlitePath)) {
+  try {
+    $db = new SQLite3($sqlitePath, SQLITE3_OPEN_READONLY);
+    $result['connectionOk'] = true;
+
+    $tableRes = $db->query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name");
+    while ($row = $tableRes->fetchArray(SQLITE3_ASSOC)) {
+      $tbl = $row['name'];
+      $dbSchema[$tbl] = [];
+      $colRes = $db->query("PRAGMA table_info(\"$tbl\")");
+      while ($col = $colRes->fetchArray(SQLITE3_ASSOC)) {
+        $dbSchema[$tbl][] = $col['name'];
+      }
+      $result['tablesInDb'][] = $tbl;
+    }
+    $db->close();
+  } catch (Throwable $e) {
+    $result['connectionError'] = 'SQLite: ' . $e->getMessage();
+  }
+} elseif (in_array($connLower, ['mysql', 'mariadb', 'mysqli'])) {
+  try {
+    $dsn = 'mysql:host=' . $dbConfig['host'];
+    if ($dbConfig['port']) $dsn .= ';port=' . $dbConfig['port'];
+    if ($dbConfig['database']) $dsn .= ';dbname=' . $dbConfig['database'];
+    $pdo = new PDO($dsn, $dbConfig['username'], $dbConfig['password'], [
+      PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+      PDO::ATTR_TIMEOUT => 5,
+    ]);
+    $result['connectionOk'] = true;
+
+    $dbName = $dbConfig['database'];
+    $stmt = $pdo->query("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = " . $pdo->quote($dbName) . " AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME");
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+      $tbl = $row['TABLE_NAME'];
+      $dbSchema[$tbl] = [];
+      $colStmt = $pdo->query("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = " . $pdo->quote($dbName) . " AND TABLE_NAME = " . $pdo->quote($tbl) . " ORDER BY ORDINAL_POSITION");
+      while ($col = $colStmt->fetch(PDO::FETCH_ASSOC)) {
+        $dbSchema[$tbl][] = $col['COLUMN_NAME'];
+      }
+      $result['tablesInDb'][] = $tbl;
+    }
+    $pdo = null;
+  } catch (Throwable $e) {
+    $result['connectionError'] = $e->getMessage();
+  }
+} else {
+  // Unknown driver, try PDO generic
+  $result['connectionError'] = 'Driver non supportato: ' . $dbConfig['connection'];
+}
+
+// ── 4. Compare ─────────────────────────────────────────────────
+
+$tablesInDbSet = array_flip($result['tablesInDb']);
+$usedTablesSet = array_flip($usedTables);
+
+foreach ($result['tablesInDb'] as $tbl) {
+  if (!isset($usedTablesSet[$tbl])) {
+    $result['tablesUnused'][] = [
+      'table' => $tbl,
+      'dbName' => $result['dbName'] ?? null,
+      'columns' => $dbSchema[$tbl] ?? [],
+    ];
+  } else {
+    // Check for unused columns
+    $unusedCols = [];
+    $usedColsInTable = $usedColumns[$tbl] ?? [];
+    $usedColsSet = array_flip($usedColsInTable);
+    foreach (($dbSchema[$tbl] ?? []) as $col) {
+      $colLower = strtolower($col);
+      $matched = false;
+      foreach ($usedColsSet as $usedCol => $_) {
+        if (strtolower($usedCol) === $colLower) { $matched = true; break; }
+        // Also match common variations
+        if (strtolower(str_replace('_', '', $usedCol)) === strtolower(str_replace('_', '', $col))) {
+          $matched = true; break;
+        }
+      }
+      if (!$matched) {
+        $unusedCols[] = $col;
+      }
+    }
+    if (!empty($unusedCols)) {
+      $result['columnsUnused'][] = [
+        'table' => $tbl,
+        'dbName' => $result['dbName'] ?? null,
+        'columns' => $unusedCols,
+        'fileCount' => count($codeFilesUsingTables[$tbl] ?? []),
+      ];
+    }
+  }
+}
+
+// ── 5. Find orphan SQLite files ───────────────────────────────
+
+$allReferencedPaths = [];
+foreach ($analysisData['files'] ?? [] as $f) {
+  if ($f['relativePath']) $allReferencedPaths[] = $f['relativePath'];
+  foreach ($f['dependencies'] ?? [] as $dep) {
+    if (!empty($dep['target']) && is_string($dep['target'])) {
+      $allReferencedPaths[] = $dep['target'];
+    }
+  }
+}
+
+// Find all SQLite database files in the project
+$sqliteExtensions = ['db', 'sqlite', 'sqlite3'];
+$allSqliteFiles = [];
+$it = new RecursiveIteratorIterator(
+  new RecursiveDirectoryIterator($projectPath, FilesystemIterator::SKIP_DOTS)
+);
+foreach ($it as $file) {
+  if ($file->isFile() && in_array(strtolower($file->getExtension()), $sqliteExtensions)) {
+    $relPath = str_replace($projectPath . '/', '', $file->getRealPath());
+    // Skip obvious system dirs
+    $skip = false;
+    foreach (['vendor/', 'node_modules/', '.git/', 'storage/framework/', 'storage/logs/'] as $sd) {
+      if (str_starts_with($relPath, $sd)) { $skip = true; break; }
+    }
+    if ($skip) continue;
+    $allSqliteFiles[] = [
+      'path' => $relPath,
+      'size' => $file->getSize(),
+    ];
+  }
+}
+
+// Filter out referenced SQLite files
+foreach ($allSqliteFiles as $sf) {
+  $referenced = false;
+  $sfLower = strtolower($sf['path']);
+  foreach ($allReferencedPaths as $ref) {
+    if ($ref && str_contains(strtolower($ref), basename($sfLower))) {
+      $referenced = true;
+      break;
+    }
+  }
+  // Check if it's the main configured database
+  if ($sqlitePath && realpath($projectPath . '/' . $sf['path']) === $sqlitePath) {
+    $referenced = true;
+  }
+  if (!$referenced) {
+    $result['orphanSqliteFiles'][] = $sf;
+  }
+}
+
+// ── Output result ──────────────────────────────────────────────
+echo json_encode($result, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+exit(0);
+
+// ── Helper: extract columns from context ───────────────────────
+function extractCols(string $context, array &$cols): void {
+  $sm = preg_match('/SELECT\s+(.+?)\s+FROM/i', $context, $m);
+  if ($sm) {
+    foreach (explode(',', $m[1]) as $s) {
+      $c = trim(preg_replace('/[`\'"\s]/', '', $s));
+      $parts = preg_split('/\s+/', $c);
+      $c = end($parts);
+      if ($c !== '*' && $c !== '' && !str_contains($c, '(') && !in_array($c, $cols)) $cols[] = $c;
+    }
+  }
+  $im = preg_match('/INSERT\s+INTO\s+\w+\s*\(([^)]+)\)/i', $context, $m);
+  if ($im) {
+    foreach (explode(',', $m[1]) as $s) {
+      $c = trim(preg_replace('/[`\'"]/', '', $s));
+      if ($c !== '' && !in_array($c, $cols)) $cols[] = $c;
+    }
+  }
+  $sm2 = preg_match('/SET\s+(\w+)\s*=/i', $context, $m);
+  if ($sm2) {
+    $c = trim($m[1]);
+    if ($c !== '' && !in_array($c, $cols)) $cols[] = $c;
+  }
+}

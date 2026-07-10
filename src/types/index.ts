@@ -23,6 +23,24 @@ export interface DbReference {
   line: number
 }
 
+export interface FlowNode {
+  id: number
+  type: 'entry' | 'function' | 'method' | 'class' | 'if' | 'else' | 'elseif' | 'foreach' | 'for' | 'while' | 'switch' | 'case' | 'try' | 'catch' | 'return' | 'throw' | 'call' | 'include' | 'assign' | 'block'
+  label: string
+  line: number
+}
+
+export interface FlowEdge {
+  source: number
+  target: number
+  label: string
+}
+
+export interface FlowGraph {
+  nodes: FlowNode[]
+  edges: FlowEdge[]
+}
+
 export interface FileInfo {
   path: string
   relativePath: string
@@ -35,6 +53,7 @@ export interface FileInfo {
   functions: string[]
   dependencies: Dependency[]
   dbReferences: DbReference[]
+  flowGraph: FlowGraph | null
 }
 
 export interface ProjectAnalysis {
@@ -57,7 +76,7 @@ export interface ProjectAnalysis {
 export interface GraphNode {
   id: string
   label: string
-  type: 'file' | 'dir' | 'table' | 'database'
+  type: 'file' | 'dir' | 'table' | 'database' | 'module'
   category: FileCategory
   size: number
   lines: number
@@ -135,6 +154,26 @@ export interface BackupEntry {
   files: { relativePath: string; size: number; reason: string }[]
 }
 
+export interface DbAuditResult {
+  dbType: string | null
+  dbName: string | null
+  configFound: boolean
+  connectionOk: boolean
+  connectionError: string | null
+  tablesInDb: string[]
+  tablesUsed: string[]
+  tablesUnused: { table: string; dbName: string | null; columns: string[] }[]
+  columnsUnused: { table: string; dbName: string | null; columns: string[]; fileCount: number }[]
+  orphanSqliteFiles: { path: string; size: number }[]
+  error?: string
+}
+
+export interface SqliteSchemaResult {
+  dbPath: string
+  tables: { name: string; columns: { name: string; type: string; nullable: boolean; pk: boolean; defaultValue: string | null }[] }[]
+  error?: string
+}
+
 declare global {
   interface Window {
     electronAPI: {
@@ -150,6 +189,13 @@ declare global {
       cleanupDelete: (projectPath: string, files: CleanupFile[]) => Promise<{ deleted: string[]; errors: { file: string; error: string }[]; backupId: string }>
       backupList: (projectPath: string) => Promise<BackupEntry[]>
       backupRestore: (backupId: string, files: string[]) => Promise<{ restored: string[]; errors: { file: string; error: string }[] }>
+      onProgress: (callback: (pct: number) => void) => void
+      computeLayout: (graphData: { nodes: { id: string }[]; edges: { source: string; target: string }[] }) => Promise<{ positions: Record<string, { x: number; y: number }> }>
+      auditDatabase: (projectPath: string) => Promise<DbAuditResult>
+      dbCleanup: (projectPath: string, actions: { dropTables: string[]; dropColumns: { table: string; columns: string[] }[]; deleteFiles: string[] }) => Promise<{ executed: string[]; errors: { item: string; error: string }[]; backupId: string }>
+      fileRead: (filePath: string) => Promise<{ content: string; error?: string }>
+      fileSave: (filePath: string, content: string) => Promise<{ success: boolean; error?: string }>
+      sqliteSchema: (dbPath: string) => Promise<SqliteSchemaResult>
     }
   }
 }

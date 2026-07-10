@@ -32,12 +32,16 @@ function createWindow() {
   } else {
     mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
   }
+
+  mainWindow.on('close', () => {
+    app.quit()
+  })
 }
 
 app.whenReady().then(createWindow)
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
+  app.quit()
 })
 
 app.on('activate', () => {
@@ -65,7 +69,7 @@ ipcMain.handle('analyze:direct', async (_event, projectPath) => {
   return projectPath
 })
 
-ipcMain.handle('analyze:project', async (_event, projectPath) => {
+ipcMain.handle('analyze:project', async (event, projectPath) => {
   const analyzerScript = path.join(__dirname, '..', 'analyzer', 'bin', 'analyze')
   const resultFile = '/tmp/php-analyzer-result.json'
   const lightFile = '/tmp/php-analyzer-light.json'
@@ -90,8 +94,17 @@ ipcMain.handle('analyze:project', async (_event, projectPath) => {
 
   let stderr = ''
   php.stderr.on('data', (data) => {
-    stderr += data.toString()
-    log(`PHP STDERR: ${data.toString().trim()}`)
+    const msg = data.toString()
+    stderr += msg
+    const trimmed = msg.trim()
+    if (trimmed.startsWith('PROGRESS:')) {
+      const pct = parseInt(trimmed.slice(9), 10)
+      if (!isNaN(pct) && mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('analysis:progress', pct)
+      }
+    } else {
+      log(`PHP STDERR: ${trimmed}`)
+    }
   })
 
   php.on('error', (err) => {
@@ -131,6 +144,52 @@ ipcMain.handle('analyze:project', async (_event, projectPath) => {
   // Don't delete the file — renderer will read it directly via another IPC call
   // Return only summary to avoid large IPC payload
   return { resultFile: targetFile, summary: result.summary }
+})
+
+const layoutBinary = path.join(__dirname, '..', 'layout', 'layout')
+
+ipcMain.handle('layout:compute', async (_event, graphData) => {
+  const jsonInput = JSON.stringify(graphData)
+  const logFile = '/tmp/electron-analyzer.log'
+  const log = (msg) => require('fs').appendFileSync(logFile, new Date().toISOString() + ' ' + msg + '\n')
+  log(`layout:compute start, ${graphData.nodes.length} nodes, ${graphData.edges.length} edges`)
+
+  return new Promise((resolve, reject) => {
+    const { spawn } = require('child_process')
+    const proc = spawn(layoutBinary, [], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+
+    let stdout = ''
+    let stderr = ''
+
+    proc.stdout.on('data', (data) => { stdout += data.toString() })
+    proc.stderr.on('data', (data) => { stderr += data.toString() })
+
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        log(`layout:compute error code=${code}: ${stderr.trim()}`)
+        reject(new Error(`Layout error: ${stderr.trim()}`))
+        return
+      }
+      try {
+        const result = JSON.parse(stdout)
+        log(`layout:compute done, ${Object.keys(result.positions).length} positions`)
+        resolve(result)
+      } catch (e) {
+        log(`layout:compute parse error: ${e.message}, stdout=${stdout.slice(0, 200)}`)
+        reject(e)
+      }
+    })
+
+    proc.on('error', (err) => {
+      log(`layout:compute spawn error: ${err.message}`)
+      reject(err)
+    })
+
+    proc.stdin.write(jsonInput)
+    proc.stdin.end()
+  })
 })
 
 function storageDir() {
@@ -207,6 +266,154 @@ ipcMain.handle('history:delete', async (_event, projectPath) => {
   const cached = cachedAnalysisPath(projectPath)
   try { require('fs').unlinkSync(cached) } catch (e) {}
   return true
+})
+
+// ── Database Audit ────────────────────────────────────────────
+
+ipcMain.handle('database:audit', async (_event, projectPath) => {
+  const logFile = '/tmp/electron-analyzer.log'
+  const log = (msg) => require('fs').appendFileSync(logFile, new Date().toISOString() + ' ' + msg + '\n')
+  log(`database:audit start ${projectPath}`)
+
+  const script = path.join(__dirname, '..', 'analyzer', 'bin', 'analyze-db')
+  return new Promise((resolve) => {
+    const { spawn } = require('child_process')
+    const php = spawn('php', [script, projectPath], {
+      cwd: path.join(__dirname, '..', 'analyzer'),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    php.stdout.on('data', (d) => { stdout += d.toString() })
+    php.stderr.on('data', (d) => { stderr += d.toString() })
+    php.on('close', (code) => {
+      if (code !== 0) {
+        log(`database:audit error code=${code}: ${stderr.trim()}`)
+        resolve({ error: `Processo uscito con codice ${code}: ${stderr.trim()}` })
+        return
+      }
+      try {
+        const result = JSON.parse(stdout)
+        log(`database:audit done ${result.tablesInDb.length} tables, ${result.orphanSqliteFiles.length} orphans`)
+        resolve(result)
+      } catch (e) {
+        log(`database:audit parse error: ${e.message}`)
+        resolve({ error: `Errore nel parsing del risultato: ${e.message}` })
+      }
+    })
+    php.on('error', (err) => {
+      log(`database:audit spawn error: ${err.message}`)
+      resolve({ error: `Errore di avvio: ${err.message}` })
+    })
+  })
+})
+
+ipcMain.handle('db:cleanup', async (_event, projectPath, actions) => {
+  const logFile = '/tmp/electron-analyzer.log'
+  const log = (msg) => require('fs').appendFileSync(logFile, new Date().toISOString() + ' ' + msg + '\n')
+  log(`db:cleanup start ${projectPath}`)
+
+  const ts = Date.now()
+  const hash = projectHash(projectPath)
+  const backupFolder = path.join(backupDir(), hash, String(ts))
+  require('fs').mkdirSync(backupFolder, { recursive: true })
+
+  const manifest = { projectPath, createdAt: new Date().toISOString(), type: 'db-cleanup', files: [], sql: [] }
+  const errors = []
+  const executed = []
+
+  // 1. Backup orphan SQLite files before deletion
+  for (const relPath of (actions.deleteFiles || [])) {
+    const src = path.join(projectPath, relPath)
+    try {
+      if (!require('fs').existsSync(src)) continue
+      const relDir = path.dirname(relPath)
+      const destDir = path.join(backupFolder, relDir)
+      if (!require('fs').existsSync(destDir)) require('fs').mkdirSync(destDir, { recursive: true })
+      require('fs').copyFileSync(src, path.join(backupFolder, relPath))
+      manifest.files.push({ relativePath: relPath, action: 'delete' })
+    } catch (e) {
+      errors.push({ item: relPath, error: e.message })
+    }
+  }
+
+  // 2. Back up main SQLite DB before modifications
+  // Try to find the main DB file
+  const sqliteCandidates = [
+    path.join(projectPath, 'database', 'database.sqlite'),
+    path.join(projectPath, 'data', 'database.sqlite'),
+    path.join(projectPath, 'app.db'),
+    path.join(projectPath, 'db.sqlite'),
+  ]
+  for (const sqlitePath of sqliteCandidates) {
+    if (require('fs').existsSync(sqlitePath)) {
+      const destDir = path.join(backupFolder, '_db_backup')
+      if (!require('fs').existsSync(destDir)) require('fs').mkdirSync(destDir, { recursive: true })
+      require('fs').copyFileSync(sqlitePath, path.join(destDir, path.basename(sqlitePath)))
+      manifest.sql.push({ file: sqlitePath, action: 'backup' })
+      break
+    }
+  }
+
+  // 3. Execute SQL operations via PHP script
+  if ((actions.dropTables && actions.dropTables.length > 0) || (actions.dropColumns && actions.dropColumns.length > 0)) {
+    const script = path.join(__dirname, '..', 'analyzer', 'bin', 'cleanup-db')
+    const input = JSON.stringify({ projectPath, actions: { dropTables: actions.dropTables || [], dropColumns: actions.dropColumns || [] } })
+
+    await new Promise((resolve) => {
+      const { spawn } = require('child_process')
+      const php = spawn('php', [script], {
+        cwd: path.join(__dirname, '..', 'analyzer'),
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+      let stdout = ''
+      let stderr = ''
+      php.stdout.on('data', (d) => { stdout += d.toString() })
+      php.stderr.on('data', (d) => { stderr += d.toString() })
+      php.on('close', (code) => {
+        try {
+          const res = JSON.parse(stdout)
+          if (res.executed) {
+            for (const e of res.executed) {
+              executed.push(e)
+              manifest.sql.push({ sql: e, action: 'execute' })
+            }
+          }
+          if (res.errors) {
+            for (const e of res.errors) errors.push({ item: 'sql', error: e })
+          }
+        } catch (e) {
+          errors.push({ item: 'php-output', error: stdout.slice(0, 500) })
+        }
+        resolve()
+      })
+      php.on('error', (err) => {
+        errors.push({ item: 'php-spawn', error: err.message })
+        resolve()
+      })
+      php.stdin.write(input)
+      php.stdin.end()
+    })
+  }
+
+  // 4. Delete orphan SQLite files
+  for (const relPath of (actions.deleteFiles || [])) {
+    const src = path.join(projectPath, relPath)
+    try {
+      if (require('fs').existsSync(src)) {
+        require('fs').unlinkSync(src)
+        log(`db:cleanup deleted file ${relPath}`)
+      }
+    } catch (e) {
+      errors.push({ item: relPath, error: e.message })
+    }
+  }
+
+  // 5. Write manifest
+  require('fs').writeFileSync(path.join(backupFolder, 'manifest.json'), JSON.stringify(manifest, null, 2))
+
+  log(`db:cleanup done executed=${executed.length} errors=${errors.length}`)
+  return { executed, errors, backupId: `${hash}/${ts}` }
 })
 
 // ── Backup & Cleanup ──────────────────────────────────────────
@@ -418,4 +625,51 @@ ipcMain.handle('backup:restore', async (_event, backupId, filesToRestore) => {
   }
 
   return { restored, errors }
+})
+
+// ── File editor: read / save ──
+ipcMain.handle('file:read', async (_event, filePath) => {
+  try {
+    const resolved = path.resolve(filePath)
+    if (!require('fs').existsSync(resolved)) return { content: '', error: 'File non trovato' }
+    const content = require('fs').readFileSync(resolved, 'utf-8')
+    return { content }
+  } catch (e) {
+    return { content: '', error: e.message }
+  }
+})
+
+ipcMain.handle('file:save', async (_event, filePath, content) => {
+  try {
+    const resolved = path.resolve(filePath)
+    require('fs').writeFileSync(resolved, content, 'utf-8')
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: e.message }
+  }
+})
+
+// ── SQLite schema browser ──
+ipcMain.handle('sqlite:schema', async (_event, dbPath) => {
+  try {
+    const resolved = path.resolve(dbPath)
+    if (!require('fs').existsSync(resolved)) return { dbPath, tables: [], error: 'File DB non trovato' }
+    // Use php script for SQLite schema
+    const scriptPath = path.join(__dirname, '..', 'analyzer', 'bin', 'sqlite-schema.php')
+    if (!require('fs').existsSync(scriptPath)) return { dbPath, tables: [], error: 'Script non trovato' }
+    const result = await new Promise((resolve, reject) => {
+      const proc = require('child_process').spawn('php', [scriptPath, resolved])
+      let stdout = '', stderr = ''
+      proc.stdout.on('data', d => stdout += d)
+      proc.stderr.on('data', d => stderr += d)
+      proc.on('close', (code) => {
+        if (code !== 0) reject(new Error(stderr || 'Exit code ' + code))
+        else try { resolve(JSON.parse(stdout)) } catch (e) { reject(new Error('JSON parse error: ' + stdout.slice(0, 200))) }
+      })
+      proc.on('error', reject)
+    })
+    return result
+  } catch (e) {
+    return { dbPath, tables: [], error: e.message }
+  }
 })

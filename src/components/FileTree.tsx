@@ -5,6 +5,7 @@ interface FileTreeProps {
   files: FileInfo[]
   selectedFile: string | null
   onFileSelect: (path: string) => void
+  onFileDoubleClick?: (path: string, fullPath: string) => void
   sortBy?: 'name' | 'size'
 }
 
@@ -88,12 +89,14 @@ function TreeItem({
   depth,
   selectedFile,
   onFileSelect,
+  onFileDoubleClick,
   sortBy,
 }: {
   node: TreeNode
   depth: number
   selectedFile: string | null
   onFileSelect: (path: string) => void
+  onFileDoubleClick?: (path: string, fullPath: string) => void
   sortBy: 'name' | 'size'
 }) {
   const [expanded, setExpanded] = React.useState(depth < 2)
@@ -117,6 +120,7 @@ function TreeItem({
         className={`tree-item ${isSelected ? 'selected' : ''}`}
         style={{ paddingLeft: 12 + depth * 16 }}
         onClick={() => onFileSelect(node.file!.relativePath)}
+        onDoubleClick={() => onFileDoubleClick?.(node.file!.relativePath, node.file!.path)}
         title={node.file.relativePath}
       >
         <span className="tree-icon">
@@ -160,6 +164,7 @@ function TreeItem({
           depth={node.name ? depth + 1 : depth}
           selectedFile={selectedFile}
           onFileSelect={onFileSelect}
+          onFileDoubleClick={onFileDoubleClick}
           sortBy={sortBy}
         />
       ))}
@@ -187,7 +192,7 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)}M`
 }
 
-export default function FileTree({ files, selectedFile, onFileSelect, sortBy = 'name' }: FileTreeProps) {
+export default function FileTree({ files, selectedFile, onFileSelect, onFileDoubleClick, sortBy = 'name' }: FileTreeProps) {
   const tree = useMemo(() => {
     const t = buildTree(files)
     sortTreeNodes(t, sortBy)
@@ -201,6 +206,7 @@ export default function FileTree({ files, selectedFile, onFileSelect, sortBy = '
         depth={0}
         selectedFile={selectedFile}
         onFileSelect={onFileSelect}
+        onFileDoubleClick={onFileDoubleClick}
         sortBy={sortBy}
       />
     </div>
